@@ -110,6 +110,7 @@ class MessageManager:
 		include_tool_call_examples: bool = False,
 		include_recent_events: bool = False,
 		sample_images: list[ContentPartTextParam | ContentPartImageParam] | None = None,
+		llm_screenshot_size: tuple[int, int] | None = None,
 	):
 		self.task = task
 		self.state = state
@@ -122,6 +123,7 @@ class MessageManager:
 		self.include_tool_call_examples = include_tool_call_examples
 		self.include_recent_events = include_recent_events
 		self.sample_images = sample_images
+		self.llm_screenshot_size = llm_screenshot_size
 
 		assert max_history_items is None or max_history_items > 5, 'max_history_items must be None or greater than 5'
 
@@ -184,6 +186,7 @@ class MessageManager:
 		step_number = step_info.step_number if step_info else None
 
 		self.state.read_state_description = ''
+		self.state.read_state_images = []  # Clear images from previous step
 
 		action_results = ''
 		result_len = len(result)
@@ -196,6 +199,11 @@ class MessageManager:
 				)
 				read_state_idx += 1
 				logger.debug(f'Added extracted_content to read_state_description: {action_result.extracted_content}')
+
+			# Store images for one-time inclusion in the next message
+			if action_result.images:
+				self.state.read_state_images.extend(action_result.images)
+				logger.debug(f'Added {len(action_result.images)} image(s) to read_state_images')
 
 			if action_result.long_term_memory:
 				action_results += f'{action_result.long_term_memory}\n'
@@ -223,7 +231,7 @@ class MessageManager:
 		self.state.read_state_description = self.state.read_state_description.strip('\n')
 
 		if action_results:
-			action_results = f'Result:\n{action_results}'
+			action_results = f'Result\n{action_results}'
 		action_results = action_results.strip('\n') if action_results else None
 
 		# Simple 60k character limit for action_results
@@ -286,10 +294,11 @@ class MessageManager:
 		model_output: AgentOutput | None = None,
 		result: list[ActionResult] | None = None,
 		step_info: AgentStepInfo | None = None,
-		use_vision: bool | Literal['auto'] = 'auto',
+		use_vision: bool | Literal['auto'] = True,
 		page_filtered_actions: str | None = None,
 		sensitive_data=None,
 		available_file_paths: list[str] | None = None,  # Always pass current available_file_paths
+		unavailable_skills_info: str | None = None,  # Information about skills that cannot be used yet
 	) -> None:
 		"""Create single state message with all content"""
 
@@ -354,6 +363,9 @@ class MessageManager:
 			vision_detail_level=self.vision_detail_level,
 			include_recent_events=self.include_recent_events,
 			sample_images=self.sample_images,
+			read_state_images=self.state.read_state_images,
+			llm_screenshot_size=self.llm_screenshot_size,
+			unavailable_skills_info=unavailable_skills_info,
 		).get_user_message(effective_use_vision)
 
 		# Store state message text for history
@@ -410,17 +422,22 @@ class MessageManager:
 
 	def _set_message_with_type(self, message: BaseMessage, message_type: Literal['system', 'state']) -> None:
 		"""Replace a specific state message slot with a new message"""
-		# Don't filter system and state messages - they should contain placeholder tags or normal conversation
+		# System messages don't need filtering - they only contain instructions/placeholders
+		# State messages need filtering - they include agent_history_description which contains
+		# action results with real sensitive values (after placeholder replacement during execution)
 		if message_type == 'system':
 			self.state.history.system_message = message
 		elif message_type == 'state':
+			if self.sensitive_data:
+				message = self._filter_sensitive_data(message)
 			self.state.history.state_message = message
 		else:
 			raise ValueError(f'Invalid state message type: {message_type}')
 
 	def _add_context_message(self, message: BaseMessage) -> None:
 		"""Add a contextual message specific to this step (e.g., validation errors, retry instructions, timeout warnings)"""
-		# Don't filter context messages - they should contain normal conversation or error messages
+		# Context messages typically contain error messages and validation info, not action results
+		# with sensitive data, so filtering is not needed here
 		self.state.history.context_messages.append(message)
 
 	@time_execution_sync('--filter_sensitive_data')
