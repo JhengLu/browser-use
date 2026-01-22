@@ -69,18 +69,25 @@ async def main():
 	logger.info("="*80)
 
 	logger.info(f"Initializing Ollama LLM...")
-	llm = ChatOllama(model="deepseek-r1:7b", host=REMOTE_OLLAMA, timeout=120.0)
+	model_name = "qwen2.5vl:32b"
+	llm = ChatOllama(model=model_name, host=REMOTE_OLLAMA, timeout=120.0)
 
-	task = "Search Google for 'what is browser automation' and tell me the top 3 results"
+	# Make the task very clear and specific to avoid hallucinations
+	task = """Go to Google.com and search for 'what is browser automation'.
+Then extract and return ONLY the top 3 search result titles and descriptions.
+Do NOT visit other websites. Do NOT search for laptops, pricing, or shopping.
+ONLY do the Google search and return the top 3 results."""
+
 	logger.info(f"Task: {task}")
-	logger.info(f"Using Ollama model: deepseek-r1:7b at {REMOTE_OLLAMA}")
+	logger.info(f"Using Ollama model: {model_name} at {REMOTE_OLLAMA}")
 
 	logger.info("Creating browser automation agent...")
 	agent = Agent(
 		task=task,
 		llm=llm,
 		llm_timeout=120,  # 2 minutes for LLM calls
-		step_timeout=300   # 5 minutes for each step
+		step_timeout=300,   # 5 minutes for each step
+		max_steps=10  # Limit to 10 steps to prevent going off track
 	)
 
 	logger.info("Starting agent execution...")

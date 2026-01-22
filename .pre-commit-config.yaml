@@ -35,6 +35,17 @@ repos:
     hooks:
     - id: pyright
 
+  - repo: local
+    hooks:
+      - id: auto-test
+        name: Auto Test Runner
+        entry: python auto_test.py --all
+        language: system
+        types: [python]
+        pass_filenames: false
+        # Only run tests if test files or core source files change
+        files: ^(tests/ci/.*\.py|browser_use/.*\.py)$
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
