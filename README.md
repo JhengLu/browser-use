@@ -40,6 +40,13 @@
 
 🌤️ Want to skip the setup? Use our <b>[cloud](https://cloud.browser-use.com)</b> for faster, scalable, stealth-enabled browser automation!
 
+# Install this custom code repo
+```bash
+git clone https://github.com/JhengLu/browser-use
+cd browser-use
+uv pip install -e .
+```
+
 # 🤖 LLM Quickstart
 
 1. Direct your favorite coding agent (Cursor, Claude Code, etc) to [Agents.md](https://docs.browser-use.com/llms-full.txt)

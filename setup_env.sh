@@ -1,6 +1,7 @@
-# With uv (recommended, matches their toolchain):
+# Create venv and install dependencies:
 uv sync
 
+source .venv/bin/activate
 # Then install Chromium:
-uv run browser-use install
+uv pip install playwright && playwright install chromium
 uv pip install steel-sdk

@@ -1,6 +1,9 @@
 import asyncio
+import json
 import logging
+import os
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from cdp_use.cdp.accessibility.commands import GetFullAXTreeReturns
@@ -29,6 +32,88 @@ if TYPE_CHECKING:
 	from browser_use.browser.session import BrowserSession
 
 # Note: iframe limits are now configurable via BrowserProfile.max_iframes and BrowserProfile.max_iframe_depth
+
+logger = logging.getLogger(__name__)
+
+# Env var to enable saving DOM tree JSON for offline analysis.
+# Set to a directory path, e.g. BROWSER_USE_DOM_TREE_SAVE_DIR=/path/to/output
+# Read at call time (not import time) so the agent script can set it after import.
+
+
+def _simplified_node_to_light_dict(node) -> dict:
+	"""Convert a SimplifiedNode to a lightweight dict for JSON export.
+
+	Only keeps fields relevant for tree-structure comparison:
+	tag name, backend_node_id, interactivity, visibility, attributes, text, children.
+	Skips heavy CDP data (snapshot_node, ax_node, etc.).
+	"""
+	orig = node.original_node
+	d = {
+		'tag': orig.node_name.lower() if orig.node_name else None,
+		'node_type': orig.node_type.name,
+		'backend_node_id': orig.backend_node_id,
+		'is_visible': orig.is_visible,
+		'is_interactive': node.is_interactive,
+	}
+	# Include attributes (compact)
+	if orig.attributes:
+		d['attributes'] = dict(orig.attributes)
+	# Include direct text for text nodes
+	if orig.node_type == NodeType.TEXT_NODE and orig.node_value:
+		text = orig.node_value.strip()
+		if text:
+			d['text'] = text[:200]  # truncate long text
+	# Children
+	children = []
+	for child in node.children:
+		children.append(_simplified_node_to_light_dict(child))
+	if children:
+		d['children'] = children
+	return d
+
+
+_dom_tree_save_counter = 0
+
+def _save_dom_tree_json(serialized_state, enhanced_tree, url: str = ''):
+	"""Save the DOM tree as a lightweight JSON file for offline comparison."""
+	global _dom_tree_save_counter
+	save_dir = os.environ.get('BROWSER_USE_DOM_TREE_SAVE_DIR', '')
+	if not save_dir:
+		return
+	try:
+		os.makedirs(save_dir, exist_ok=True)
+		_dom_tree_save_counter += 1
+		timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+		filename = f'dom_tree_{_dom_tree_save_counter:03d}_{timestamp}.json'
+		filepath = os.path.join(save_dir, filename)
+
+		# Build lightweight tree from SimplifiedNode root
+		light_tree = None
+		if serialized_state._root:
+			light_tree = _simplified_node_to_light_dict(serialized_state._root)
+
+		# Build selector map summary (interactive elements)
+		selector_summary = {}
+		for bid, enode in serialized_state.selector_map.items():
+			selector_summary[str(bid)] = {
+				'tag': enode.node_name.lower() if enode.node_name else None,
+				'attributes': dict(enode.attributes) if enode.attributes else {},
+			}
+
+		result = {
+			'request_number': _dom_tree_save_counter,
+			'timestamp': timestamp,
+			'url': url,
+			'tree': light_tree,
+			'interactive_elements': selector_summary,
+			'interactive_count': len(serialized_state.selector_map),
+		}
+
+		with open(filepath, 'w') as f:
+			json.dump(result, f, indent=2, ensure_ascii=False)
+		logger.info(f'DOM tree saved to: {filepath}')
+	except Exception as e:
+		logger.warning(f'Failed to save DOM tree JSON: {e}')
 
 
 class DomService:
@@ -827,6 +912,10 @@ class DomService:
 		get_serialized_overhead_ms = total_get_serialized_dom_tree_ms - tracked_major_operations_ms
 		if get_serialized_overhead_ms > 0.1:
 			timing_info['get_serialized_dom_tree_overhead_ms'] = get_serialized_overhead_ms
+
+		# Save DOM tree JSON if configured
+		if os.environ.get('BROWSER_USE_DOM_TREE_SAVE_DIR', ''):
+			_save_dom_tree_json(serialized_dom_state, enhanced_dom_tree)
 
 		return serialized_dom_state, enhanced_dom_tree, timing_info
 
