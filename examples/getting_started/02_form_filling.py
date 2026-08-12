@@ -31,7 +31,7 @@ from browser_use import ChatBrowserUse
 
 async def main():
 	# Initialize the model
-	llm = ChatBrowserUse()
+	llm = ChatBrowserUse(model='bu-2-0')
 
 	# Define a form filling task
 	task = """

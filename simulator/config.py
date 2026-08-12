@@ -1,0 +1,86 @@
+"""Shared configuration: paths, constants, and the RunConfig dataclass."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+# --- paths ---------------------------------------------------------------- #
+PKG_DIR = Path(__file__).parent
+DATA_DIR = PKG_DIR / 'data'
+RUNS_DIR = PKG_DIR / 'runs'
+WEBVOYAGER_JSONL = DATA_DIR / 'webvoyager_data.jsonl'
+GAIA_JSONL = DATA_DIR / 'gaia_web.jsonl'
+REFERENCE_JSON = DATA_DIR / 'reference_answer.json'
+WEBARENA_JSON = DATA_DIR / 'webarena_test.raw.json'
+
+# --- provider ------------------------------------------------------------- #
+DEFAULT_MODEL = 'qwen3.5-omni-plus-2026-03-15'  # multimodal (text+image); fallback: 'qwen3-vl-plus'
+DEFAULT_JUDGE_MODEL = 'qwen3.5-omni-plus-2026-03-15'  # multimodal, for the WebVoyager success judge
+DASHSCOPE_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+
+# --- TreeSparseAttention server (OpenAI-compatible, served on spark01) ----- #
+# Point the agent LLM at the local TSA server instead of DashScope/Qwen. The TSA
+# server has no server-side json_schema (xgrammar absent), so structured output is
+# requested via the system prompt and parsed from the text (see core/runner.py).
+# Reach it via an SSH tunnel, e.g.:
+#   ssh -N -L 10000:<container-ip>:10000 shiqihe@spark01.eecs.umich.edu
+USE_TSA = os.environ.get('USE_TSA', '1').lower() not in ('0', 'false', 'no')
+TSA_BASE_URL = os.environ.get('TSA_BASE_URL', 'http://localhost:10000/v1')
+TSA_MODEL = os.environ.get('TSA_MODEL', 'tree-sparse')
+TSA_API_KEY = os.environ.get('TSA_API_KEY', 'EMPTY')  # TSA ignores auth
+
+# Appended to every agent's system prompt so it routes around CAPTCHAs itself
+# instead of stalling (we intentionally do not pause-and-wait in the simulator).
+CAPTCHA_NUDGE = (
+	'If you encounter a CAPTCHA, reCAPTCHA, bot-detection, or a "verify you are human" wall, '
+	'do NOT stop and do NOT repeatedly wait for it to clear. You may try one direct recovery '
+	'action (for example clicking the visible verification control or refreshing the page), but '
+	'if it is still blocked, immediately switch strategy: use a different navigation path, edit '
+	'the URL, use the site search, open another section of the same site, or use an alternative '
+	'reputable source to answer the user. Do not end with "cannot bypass" or ask the user what to '
+	'do next while useful fallback paths remain. Keep making progress and only report the obstacle '
+	'after you have tried a concrete fallback and provided the best available answer.'
+)
+
+LONGER_THINKING_NUDGE = (
+	'For each step, fill the existing JSON "thinking" string before choosing actions. Make that '
+	'thinking a little more deliberate than usual, but keep it to 2-4 concise sentences: inspect '
+	'the visible page state, compare it with the task goal, call out any uncertainty or recovery '
+	'path, then choose the next concrete action. Return exactly one valid JSON object matching '
+	'the schema, with no Markdown fences and no top-level array.'
+)
+
+# Fix for the two dominant NON-verification failure modes seen in the 30B top-k32 runs:
+#   done_misuse (26%): model calls done() early with text = a next-action ("enter Python in search bar")
+#   element_index (35%): model repeats the same click index and ignores "page may have changed" errors
+DONE_LOOP_NUDGE = (
+	'DONE ACTION: only call the `done` action when the WHOLE task is finished. Its `text` must be the '
+	'FINAL ANSWER — the actual facts/values the user asked for — NOT a description of a next action '
+	'(never "click X", "enter Y in the search bar", "scroll down"). Do not call done in the first few '
+	'steps or before you have actually obtained the answer.\n'
+	'ANTI-LOOP: the interactive element indices are re-numbered every step. If an action just failed '
+	'("Element index N not available - page may have changed") or the same action made no visible '
+	'progress, do NOT repeat it — re-read the CURRENT screenshot and element list and pick a DIFFERENT '
+	'element, or scroll, before acting again.'
+)
+# CAPTCHA_NUDGE + the done/anti-loop guidance, appended to every agent's system prompt.
+COMBINED_NUDGE = CAPTCHA_NUDGE + '\n\n' + DONE_LOOP_NUDGE
+
+
+@dataclass(slots=True)
+class RunConfig:
+	"""Everything the run/capture flows need to execute a batch of tasks."""
+
+	task_num: int = 2
+	batch_size: int = 2
+	source: str = 'both'  # 'webvoyager' | 'gaia' | 'both'
+	model: str = DEFAULT_MODEL
+	max_steps: int = 20
+	task_timeout: float = 300.0  # heavy sites under several headed browsers run ~30-50s/step
+	llm_timeout: float = 150.0
+	max_wait: float = 1.5  # how long to wait to fill a batch before dispatching a partial one (see note below)
+	use_vision: bool = True  # send the screenshot to the model each step (multimodal)
+	shuffle: bool = False
+	seed: int = 0

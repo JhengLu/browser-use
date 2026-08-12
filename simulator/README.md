@@ -1,0 +1,269 @@
+# simulator
+
+A small, transparent harness for running [WebVoyager](https://github.com/MinorJerry/WebVoyager)
+and GAIA-web tasks with browser-use at scale: run many tasks **in parallel** (each
+in its own headed window) with **batched LLM inference**, **capture** full per-step
+trajectories, and **evaluate** them offline.
+
+**LLM backend** (pick one):
+
+- **TreeSparseAttention server** (default, `USE_TSA=1`) — a local OpenAI-compatible
+  server (`TreeSparseAttention/serve.py`) serving **Qwen3-VL-30B-A3B-Instruct** with
+  either **tree-sparse** (`--top-k 32`) or **full/dense** (`--top-k 100000`) attention.
+  Attention is the *only* variable between the sparse and dense runs — the basis of the
+  sparse-vs-dense accuracy comparison. See **Server setup** below.
+- **DashScope / Qwen** (`USE_TSA=0`) — the `ChatDashScope` provider (`qwen3.5-omni`,
+  `qwen-vl-max` as the multimodal judge). Set `DASHSCOPE_API_KEY`.
+
+## Layout
+
+```
+simulator/
+  config.py      constants + RunConfig + USE_TSA / TSA_* server settings
+  tasks.py       WebVoyager + GAIA loaders + reference answers
+  core/          the run engine
+    batching.py    BatchCoordinator (the batch barrier) + BatchLLMProxy
+    recorder.py    TrajectoryRecorder + RecordingProxy
+    runner.py      worker pool + run_batch + run_capture
+  eval/          offline evaluation
+    success.py     WebVoyager multimodal judge (reference-aware) -> SUCCESS/NOT SUCCESS
+    replay.py      action-replay fidelity
+    common.py      shared client + task-dir discovery
+  scripts/       standalone experiments / tooling
+    download_data.py     fetch the third-party datasets
+    analysis.py          WebArena vs WebVoyager context-length study
+    trajectory_stats.py  context/output token-length stats over a captured run
+    merge_runs.py        success-preferring merge of two runs (+ optional HF upload)
+  __main__.py    CLI
+  data/          datasets + reference answers     runs/  generated output (gitignored)
+  tests/         unit tests (no network)
+```
+
+## Server setup — TreeSparseAttention (top-k 32 sparse / dense)
+
+The agent **and** the success judge talk to a TreeSparseAttention `serve.py` instance
+(OpenAI-compatible). Sparsity is a single knob: `--top-k 32` (tree-sparse decode) vs
+`--top-k 100000` (the selector picks all chunks ⇒ full/dense attention).
+
+**1. Serving env** (on the GPU box / container). Use the TreeSparseAttention repo on
+branch `shiqihe/dev/simulator`, which adds the two fixes needed to serve Qwen3-VL-30B
+for agentic use, then install the two extra deps:
+
+```bash
+pip install accelerate xgrammar
+```
+
+- `device_map="cuda"` in the loader — streams shards directly to GPU, avoiding the
+  ~2× (CPU + GPU) memory peak that OOMs a 30B on unified memory.
+- `mm_token_type_ids` threaded through prefill — transformers ≥5.x requires it for
+  Qwen3-VL multimodal M-RoPE; without it every screenshot request 500s.
+
+**2. Launch the server** — sparse (top-k 32):
+
+```bash
+python3 serve.py \
+  --model-path /path/to/Qwen3-VL-30B-A3B-Instruct \
+  --host 0.0.0.0 --port 10000 \
+  --top-k 32 --page-size 64 \
+  --max-decode-tokens 4096 --max-batch-size 8 --batch-collect-ms 150 \
+  --tree-parse-mode webarena --served-model-name tree-sparse
+# dense baseline: identical command, but --top-k 100000
+# xgrammar constrained decoding is ON by default (--disable-xgrammar to turn off)
+```
+
+**3. Tunnel** (if the simulator runs on a different machine than the server):
+
+```bash
+ssh -N -L 10000:<server-or-container-ip>:10000 user@gpu-host
+```
+
+**4. Point the simulator at it** (env; these are the defaults):
+
+```bash
+export USE_TSA=1
+export TSA_BASE_URL=http://localhost:10000/v1
+export TSA_MODEL=tree-sparse
+```
+
+Each step the simulator sends an OpenAI `response_format` JSON schema; the server's
+**xgrammar** grammar-constrains decoding to it, so the agent emits a valid action even
+under aggressive sparsity. (Top-k 32 *without* grammar degenerates into malformed JSON
+— grammar is what keeps the sparse run functional.)
+
+## Datasets — fetch first
+
+The raw WebVoyager + GAIA-web datasets are **third-party and gitignored** (not committed
+to this repo). Fetch them once into `data/` before running:
+
+```bash
+python -m simulator.scripts.download_data          # skip files already present
+python -m simulator.scripts.download_data --force  # re-download everything
+```
+
+This pulls from the upstream [WebVoyager](https://github.com/MinorJerry/WebVoyager) /
+[WebArena](https://github.com/web-arena-x/webarena) repos:
+
+- `data/webvoyager_data.jsonl` — 643 tasks, 15 live sites; reference answers in
+  `data/reference_answer.json` (per-site, types `golden`/`possible`).
+- `data/gaia_web.jsonl` — 90 GAIA web tasks, each with an inline ground-truth answer.
+- `data/webarena_test.raw.json` — WebArena tasks (used by the context-length study).
+
+`--source {both,webvoyager,gaia}` selects which to draw from (default `both`).
+
+## Usage
+
+```bash
+# full WebVoyager + GAIA capture (sparse run), headed + vision on, resumable:
+python -m simulator capture --task-num 999 --source both \
+    --batch-size 3 --max-steps 30 --task-timeout 1800 --llm-timeout 240 \
+    --out-dir simulator/runs/WebVoyager-GAIA-sparse-topk32
+# generous budgets for a thorough run: up to 30 steps and 30 min (1800s) per task
+
+# success eval — judge is the served Qwen3-VL in FULL attention,
+# so restart the server at --top-k 100000 first, then:
+USE_TSA=1 python -m simulator eval simulator/runs/WebVoyager-GAIA-sparse-topk32 --mode success
+
+# action-replay fidelity (can the recorded context reproduce each step offline?):
+python -m simulator eval simulator/runs/<run> --mode replay
+
+# replay-mode LATENCY benchmark — batched replay of recorded contexts vs the server (no browser):
+python -m simulator latency simulator/runs/<run> --task-num 16 --batch-size 4 \
+    --start random --max-tokens 1024 --top-k-label 32
+# sweep top-k by restarting the server at --top-k 32 / 64 / 100000 and re-running with the matching --top-k-label
+
+# token-length stats over a captured run (text only; per domain / overall / by step)
+python -m simulator.scripts.trajectory_stats context simulator/runs/<run>
+
+# success-preferring merge of another run into this one (+ optional HF upload)
+python -m simulator.scripts.merge_runs simulator/runs/<run> simulator/runs/<other_run>
+
+# WebArena vs WebVoyager context-length experiment
+python -m simulator.scripts.analysis structure | measure | compare
+```
+
+## Controlled experiments — `SIM_TASK_IDS` and `SIM_NO_VISION`
+
+Two env vars exist so several server configurations can be compared on **exactly** the same work.
+
+| Env var | Effect |
+|---|---|
+| `SIM_TASK_IDS=<file.json>` | Restrict the run to a fixed task subset. The file is a JSON list of `folder_name` strings (`"webvoyager__Allrecipes--3"`) or `{"source":…, "id":…}` objects. |
+| `SIM_NO_VISION=1` | Run the agent **text-only** — no screenshot is sent to the LLM. Needed when comparing sparse-attention settings, where image KV would otherwise dominate the context and confound the comparison. |
+
+**`--task-num` truncates *before* `SIM_TASK_IDS` filters.** `load_tasks()` returns `tasks[:task_num]`,
+and the subset filter is applied to what survives — so `--task-num 50` with a 50-id file yields the
+*intersection* of "first 50 alphabetically" and your subset, which is usually a handful. Pass a
+`--task-num` larger than the corpus (e.g. `100000`) and let the id file do the selecting. Always
+check the line it prints:
+
+```
+SIM_TASK_IDS: restricted to 50 tasks from .../half1_folder_names.json
+```
+
+If that number is not what you expect, the run is measuring something else. Nothing errors.
+
+### Offline replay: comparing attention configurations on identical steps
+
+The offline protocol replays each recorded step's **exact context** against a differently-configured
+server and compares the action it produces to the reference trajectory. Because the context is
+replayed rather than re-derived, errors do not compound — it isolates "given this exact page, does
+the model still pick the right element" from "can the agent recover from its own earlier mistakes".
+
+1. **Pick the task set.** Sample complete trajectories (every step of every task) that a reference
+   model completed successfully. Partial trajectories cannot be evaluated end-to-end. Write the
+   `folder_name`s to a JSON file for `SIM_TASK_IDS`.
+
+2. **Export the contexts once.** Each record holds the replayed messages plus the reference action,
+   so every configuration afterwards sees byte-identical input.
+
+3. **For each configuration:** restart the server with those flags, wait until it answers, then
+   replay. Only the server flags change between runs — same data, same client, same judge.
+
+```bash
+# per configuration: restart the server, then replay the same recorded steps
+python3 serve.py --model-path /models/Qwen3-VL-30B-A3B-Instruct --port 10000 \
+    --page-size 64 --top-k 64 --tree-parse-mode webarena --scoring-method envelope \
+    --disable-cuda-graph &
+
+python -m simulator eval simulator/runs/<run> --mode replay
+```
+
+**Match the budget, not `top_k`.** The number of KV tokens actually attended per decode step is
+`page_size × top_k`, and page sizes differ across methods — so `--page-size 64 --top-k 64` and
+`--page-size 16 --top-k 256` are the comparable pair (both 4096), not two runs sharing a `top_k`.
+
+**Cluster your statistics by task.** Steps are nested within tasks and are not independent; treating
+each step as an independent sample overstates significance. Use the task as the unit (sign test over per-task
+counts, or a bootstrap that resamples tasks).
+
+Two properties of the metrics worth knowing before reading any result:
+
+- `agree` (chose the same element as the reference) has a ceiling well below 100% — many tasks admit
+  several correct paths, so a valid-but-different click counts as disagreement. Run a full-attention
+  configuration as the yardstick; comparing against 100% is meaningless.
+- "emitted no element index at all" occurs at a similar rate for every configuration including
+  dense, so it is not attributable to whatever is being tested.
+
+### Online end-to-end on the same subset
+
+The online counterpart runs the real agent loop — the agent's own actions drive the browser from the
+task's start URL, with no recorded trajectory involved:
+
+```bash
+USE_TSA=1 TSA_BASE_URL=http://localhost:10000/v1 \
+SIM_HEADLESS=0 SIM_NO_VISION=1 SIM_TASK_IDS=<subset.json> \
+python -m simulator capture --task-num 100000 --batch-size 6 --source both \
+    --max-steps 20 --task-timeout 5640 --llm-timeout 900 \
+    --out-dir simulator/runs/online-<config>
+```
+
+Set `--task-timeout` from the **measured** per-step latency, not from a guess: at ~29k-token
+contexts and batch 6 a step takes minutes, not seconds, and a timeout that admits fewer steps than
+`--max-steps` silently makes the step cap dead letter and turns most tasks into timeouts. Measure one
+configuration first, then size the budget as `max_steps × observed_step_time`.
+
+Use headed (`SIM_HEADLESS=0`) for real sites — headless triggers bot-blocking, and blocked pages come
+back with a handful of elements, which looks like a model failure rather than a fetch failure.
+
+The `success` judge sees the task + the agent's answer + the **reference answer**
+(ground truth) + the last `k` screenshots and returns SUCCESS / NOT SUCCESS
+(temperature 0, grammar-constrained verdict). Both eval modes read only captured files;
+neither opens a browser.
+
+The **`latency`** subcommand measures serving latency by replaying recorded contexts (no
+browser, no web). It samples `--task-num` tasks from a captured run, holds `--batch-size`
+of them active (**continuous refill**: when a task's trajectory ends, its end-to-end latency
+is recorded and the next task is pulled in), and each iteration sends every active task's
+*current-step* recorded context to the server **concurrently in lockstep** — the server's
+scheduler batches them into **one batched prefill+decode** (verify via its `Collected batch of N`
+log) — then waits for all and records that batch step's latency. `--start {zero,random}` begins
+each task at step 0 or a uniformly random step (then replays to its end); decode is
+xgrammar-constrained with each step's recorded JSON schema, exactly like the live run. Results
+(per-batch-step latency, per-task end-to-end latency, decode tokens, context-size proxy) are
+written to `latency_*.json` under the run folder. To compare sparsity, restart the server at
+`--top-k 32 / 64 / 100000` and re-run with the matching `--top-k-label`. Set the server's
+`--max-batch-size ≥ batch_size` so the whole batch lands in one forward. Note: the server's
+`usage.prompt_tokens` is 0, so exact (multimodal) prefill token counts aren't returned over the
+API — the harness records a text-char + image-count proxy, and the exact prefill lengths are in
+the server log (`Prefilling request …: N tokens`).
+
+Notes:
+- Each step re-prefills the full prompt and **prefill is dense for both arms** — tree-sparse
+  only sparsifies *decode* attention, so the end-to-end speedup lives in decode and grows
+  with batch size and context length.
+- `simulator/runs/` is gitignored — generated trajectories / results are not source.
+
+## Agent prompt & robustness
+
+During `run`/`capture` the agent's system prompt is extended (see `config.py`) with a
+**CAPTCHA/anti-bot nudge** (try one recovery action, else switch strategy — never stall
+or punt to the user) and a **thinking nudge** (fill the JSON `thinking` with 2–4
+deliberate sentences, then emit exactly one JSON object). Per-call LLM latency is bounded
+by `--llm-timeout` (default 150 s). The success judge is instructed to put its
+`SUCCESS`/`NOT SUCCESS` verdict on the first line for reliable parsing.
+
+## Tests
+
+```bash
+uv run pytest -vxs simulator/tests
+```
